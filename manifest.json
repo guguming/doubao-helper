@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "对话导出助手",
   "description": "将当前豆包或 DeepSeek 对话导出为 Markdown 或 JSON，支持接口读取与滚动兜底。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "action": {
     "default_title": "导出当前对话",
     "default_popup": "popup.html",
@@ -26,7 +26,7 @@
         "https://www.doubao.com/chat/*",
         "https://*.doubao.com/chat/*"
       ],
-      "js": ["content.js"],
+      "js": ["content-core.js", "content.js"],
       "run_at": "document_start"
     },
     {
@@ -49,5 +49,5 @@
       "matches": ["https://chat.deepseek.com/*"]
     }
   ],
-  "permissions": ["activeTab", "scripting"]
+  "permissions": ["activeTab", "scripting", "storage"]
 }

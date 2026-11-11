@@ -8,6 +8,10 @@ const maxCollectScreensEl = document.getElementById("maxCollectScreens");
 const maxApiPagesEl = document.getElementById("maxApiPages");
 const apiPageSizeEl = document.getElementById("apiPageSize");
 const apiStartAnchorEl = document.getElementById("apiStartAnchor");
+const resumeModeEl = document.getElementById("resumeMode");
+const sinceDateRowEl = document.getElementById("sinceDateRow");
+const sinceDateEl = document.getElementById("sinceDate");
+const cursorInfoEl = document.getElementById("cursorInfo");
 const exportButtons = [document.getElementById("exportMarkdown"), document.getElementById("exportJson")];
 const stopButton = document.getElementById("stopExport");
 let currentExportId = "";
@@ -17,6 +21,61 @@ document.getElementById("exportMarkdown").addEventListener("click", () => export
 document.getElementById("exportJson").addEventListener("click", () => exportChat("json"));
 stopButton.addEventListener("click", stopExport);
 installFloatingButtonOnActiveTab();
+initIncrementalControls();
+
+resumeModeEl.addEventListener("change", syncResumeControls);
+sinceDateEl.addEventListener("change", syncResumeControls);
+
+function syncResumeControls() {
+  const mode = resumeModeEl.value;
+  sinceDateRowEl.hidden = mode !== "date";
+  if (mode === "date" && !sinceDateEl.value) sinceDateEl.value = defaultSinceDate();
+}
+
+function defaultSinceDate() {
+  const date = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T00:00`;
+}
+
+async function initIncrementalControls() {
+  const mode = resumeModeEl.value;
+  sinceDateRowEl.hidden = mode !== "date";
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const chatId = getChatId(tab?.url || "");
+    if (!chatId) {
+      cursorInfoEl.textContent = "增量续传只支持豆包会话页。";
+      return;
+    }
+    const key = `doubaoExportCursor:${chatId}`;
+    const store = await chrome.storage.local.get(key);
+    const cursor = store?.[key];
+    if (!cursor?.lastCreateTime) {
+      cursorInfoEl.textContent = "该会话还没有导出记录，先做一次完整导出才能在“上次位置”续传。";
+      return;
+    }
+    const when = new Date(cursor.lastCreateTime * 1000);
+    const pad = (value) => String(value).padStart(2, "0");
+    const text =
+      `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ` +
+      `${pad(when.getHours())}:${pad(when.getMinutes())}`;
+    cursorInfoEl.textContent = `上次导出到 ${text}（${cursor.messageCount || 0} 条）`;
+    if (!sinceDateEl.value) sinceDateEl.value = defaultSinceDate();
+  } catch (_error) {
+    cursorInfoEl.textContent = "";
+  }
+}
+
+function getChatId(url) {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/^\/chat\/(?:bot\/chat\/)?(\d+)\/?$/);
+    return match ? match[1] : "";
+  } catch (_error) {
+    return "";
+  }
+}
 
 async function exportChat(format) {
   currentExportId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -40,9 +99,11 @@ async function exportChat(format) {
       exportMode: exportModeEl.value,
       maxSeekSteps: readLimit(maxSeekStepsEl, 240),
       maxCollectScreens: readLimit(maxCollectScreensEl, 300),
-      maxApiPages: readLimit(maxApiPagesEl, 1000, 1, 5000),
-      apiPageSize: readLimit(apiPageSizeEl, 20, 1, 50),
-      apiStartAnchor: readOptionalLimit(apiStartAnchorEl, 0, Number.MAX_SAFE_INTEGER)
+      maxApiPages: readLimit(maxApiPagesEl, 5000, 1, 20000),
+      apiPageSize: readLimit(apiPageSizeEl, 50, 1, 50),
+      apiStartAnchor: readOptionalLimit(apiStartAnchorEl, 0, Number.MAX_SAFE_INTEGER),
+      resumeMode: resumeModeEl.value,
+      sinceDate: resumeModeEl.value === "date" ? sinceDateEl.value : undefined
     });
 
     if (!response?.ok) {
@@ -104,7 +165,7 @@ async function sendExportMessage(tab, payload) {
   if (site) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: [site.script]
+      files: site.scripts
     });
   }
   return chrome.tabs.sendMessage(tab.id, payload);
@@ -124,10 +185,10 @@ function getChatSite(value) {
   try {
     const url = new URL(value);
     if (/(^|\.)doubao\.com$/.test(url.hostname) && /^\/chat\/(?:bot\/chat\/)?\d+\/?$/.test(url.pathname)) {
-      return { name: "doubao", script: "content.js" };
+      return { name: "doubao", scripts: ["content-core.js", "content.js"] };
     }
     if (url.hostname === "chat.deepseek.com" && /^\/(?:a\/)?chat\/s\/[0-9a-zA-Z-]{8,}\/?$/.test(url.pathname)) {
-      return { name: "deepseek", script: "deepseek-content.js" };
+      return { name: "deepseek", scripts: ["deepseek-content.js"] };
     }
     return null;
   } catch (_error) {

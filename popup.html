@@ -27,6 +27,22 @@
         </select>
       </label>
 
+      <label class="field">
+        <span>增量导出</span>
+        <select id="resumeMode">
+          <option value="off" selected>关闭（完整导出）</option>
+          <option value="last">从上次导出位置继续</option>
+          <option value="date">从指定日期开始</option>
+        </select>
+      </label>
+
+      <label class="field" id="sinceDateRow" hidden>
+        <span>起始日期</span>
+        <input id="sinceDate" type="datetime-local" />
+      </label>
+
+      <p id="cursorInfo" class="settings-note"></p>
+
       <details class="advanced">
         <summary>高级设置</summary>
         <section class="settings" aria-label="导出限制">
@@ -41,11 +57,11 @@
           <p class="settings-note">以下三项只对豆包生效，DeepSeek 一次读取整个会话。</p>
           <label>
             <span>接口页数</span>
-            <input id="maxApiPages" type="number" min="1" max="5000" step="1" value="1000" />
+            <input id="maxApiPages" type="number" min="1" max="20000" step="1" value="5000" />
           </label>
           <label>
             <span>每页条数</span>
-            <input id="apiPageSize" type="number" min="1" max="50" step="1" value="20" />
+            <input id="apiPageSize" type="number" min="1" max="50" step="1" value="50" />
           </label>
           <label>
             <span>起始 Anchor</span>

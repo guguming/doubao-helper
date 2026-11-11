@@ -1,7 +1,12 @@
 (() => {
-  const SCRIPT_VERSION = "0.5.3";
-  const DISPLAY_VERSION = "0.4.0";
+  const SCRIPT_VERSION = "0.6.0";
+  const DISPLAY_VERSION = "0.5.0";
   const FLOATING_BUTTON_TEXT = `导出当前会话内容 v${DISPLAY_VERSION}`;
+  const Core = globalThis.DoubaoExportCore;
+  if (!Core) {
+    console.error("[Doubao Export] content-core.js 未加载，导出功能不可用。");
+    return;
+  }
   if (window.__doubaoExportInstalled === SCRIPT_VERSION) return;
   window.__doubaoExportInstalled = SCRIPT_VERSION;
   const exportControllers = new Map();
@@ -47,28 +52,112 @@
       progress({ stage: "start", message: "开始读取当前对话", count: 0 });
 
       const limits = normalizeLimits(options);
-      const result = await collectMessages(options, progress, controller, limits);
+      const chatInfo = getDoubaoChatInfo();
+      const cursor = await readExportCursor(chatInfo.id);
+      const cutoff = Core.resolveCutoff(options, cursor);
+
+      if (cutoff.missingCursor) {
+        throw new Error("还没有可用的导出记录，无法“从上次位置续传”。请先做一次完整导出，或改用“从指定日期开始”。");
+      }
+      if (cutoff.invalidDate) {
+        throw new Error("增量起始时间无效，请填写 YYYY-MM-DD 或 YYYY-MM-DD HH:mm。");
+      }
+
+      const result = await collectMessages(options, progress, controller, limits, {
+        cutoff,
+        keepRaw: options.format === "json" && options.includeRaw !== false
+      });
       const messages = Array.isArray(result) ? result : result.messages;
       const exportMeta = Array.isArray(result) ? {} : result.meta;
 
       checkCancelled(controller);
       if (!messages.length) {
-        throw new Error("没有识别到聊天内容，确认当前页面是豆包对话页并等待加载完成。");
+        throw new Error(
+          cutoff.mode === "off"
+            ? "没有识别到聊天内容，确认当前页面是豆包对话页并等待加载完成。"
+            : `自 ${formatCutoffLabel(cutoff)} 之后没有新消息，无需导出。`
+        );
       }
 
-      const payload = buildPayload(messages, exportMeta);
+      const payload = Core.buildPayload(messages, exportMeta, {
+        url: location.href,
+        title: document.title,
+        chatId: chatInfo.id || location.pathname.split("/").filter(Boolean).pop() || ""
+      });
       const format = options.format === "json" ? "json" : "markdown";
-      const content = format === "json" ? JSON.stringify(payload, null, 2) : toMarkdown(payload);
+      const incremental = cutoff.mode !== "off";
+      const content =
+        format === "json"
+          ? JSON.stringify(payload, null, 2)
+          : Core.toMarkdown(payload, {
+              incremental,
+              incrementalLabel: incremental ? formatCutoffLabel(cutoff) : ""
+            });
       const mime = format === "json" ? "application/json" : "text/markdown";
       const ext = format === "json" ? "json" : "md";
-      const filename = `doubao-chat-${payload.chatId || "export"}-${timestampForFile()}.${ext}`;
+      const suffix = incremental ? `-incremental-from-${cutoffLabelForFile(cutoff)}` : "";
+      const filename = `doubao-chat-${payload.chatId || "export"}${suffix}-${timestampForFile()}.${ext}`;
 
       downloadText(filename, content, mime);
-      progress({ stage: "done", message: `已生成 ${messages.length} 条消息`, count: messages.length });
-      return { count: messages.length, filename };
+      await saveExportCursor(chatInfo.id, messages);
+
+      const integrity = exportMeta.integrity || {};
+      const warn = integrity.truncated ? "（翻页未到最旧一条，见文件头说明）" : "";
+      progress({
+        stage: "done",
+        message: `已生成 ${messages.length} 条消息${warn}`,
+        count: messages.length
+      });
+      return { count: messages.length, filename, integrity };
     } finally {
       if (options.exportId) exportControllers.delete(options.exportId);
     }
+  }
+
+  function formatCutoffLabel(cutoff) {
+    if (!cutoff?.cutoffMs) return cutoff?.mode === "last" ? "上次导出位置" : "开始";
+    const text = Core.formatTimestamp(Math.floor(cutoff.cutoffMs / 1000));
+    return cutoff.mode === "last" ? `上次导出位置（${text}）` : text;
+  }
+
+  function cutoffLabelForFile(cutoff) {
+    if (!cutoff?.cutoffMs) return "start";
+    return Core.formatDateOnly(Math.floor(cutoff.cutoffMs / 1000)).replace(/-/g, "");
+  }
+
+  function cursorStorageKey(conversationId) {
+    return `doubaoExportCursor:${conversationId || "unknown"}`;
+  }
+
+  async function readExportCursor(conversationId) {
+    try {
+      if (!chrome.storage?.local) return null;
+      const key = cursorStorageKey(conversationId);
+      const store = await chrome.storage.local.get(key);
+      return store?.[key] || null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function saveExportCursor(conversationId, messages) {
+    try {
+      if (!chrome.storage?.local || !conversationId) return;
+      const timed = messages.filter((message) => message.createTime > 0);
+      const lastTime = timed.length ? Math.max(...timed.map((message) => message.createTime)) : 0;
+      const lastIndex = messages.reduce((max, message) => Math.max(max, Core.toInteger(message.index)), 0);
+      const newest = timed.find((message) => message.createTime === lastTime);
+      await chrome.storage.local.set({
+        [cursorStorageKey(conversationId)]: {
+          conversationId,
+          lastCreateTime: lastTime,
+          lastIndex: lastIndex || Core.toInteger(newest?.index),
+          lastMessageId: newest?.messageId || "",
+          messageCount: messages.length,
+          exportedAt: new Date().toISOString()
+        }
+      });
+    } catch (_error) {}
   }
 
   function installFloatingExportButton() {
@@ -127,9 +216,10 @@
           autoScroll: false,
           maxSeekSteps: 240,
           maxCollectScreens: 300,
-          maxApiPages: 1000,
-          apiPageSize: 20,
-          apiStartAnchor: undefined
+          maxApiPages: 5000,
+          apiPageSize: 50,
+          apiStartAnchor: undefined,
+          resumeMode: "off"
         });
         button.textContent = `已导出 ${result.count} 条`;
         button.style.background = "#16a34a";
@@ -293,16 +383,16 @@
     }
   }
 
-  async function collectMessages(options, progress, controller, limits) {
+  async function collectMessages(options, progress, controller, limits, context = {}) {
     const mode = options.exportMode || "api-first";
 
     if (mode === "api-only") {
-      return collectByApi(progress, controller, limits);
+      return collectByApi(progress, controller, limits, context);
     }
 
     if (mode === "api-first") {
       try {
-        const apiMessages = await collectByApi(progress, controller, limits);
+        const apiMessages = await collectByApi(progress, controller, limits, context);
         if (apiMessages.messages.length) return apiMessages;
         throw new Error("接口没有返回可导出的消息。");
       } catch (error) {
@@ -344,34 +434,38 @@
     };
   }
 
-  async function collectByApi(progress, controller, limits) {
+  async function collectByApi(progress, controller, limits, context = {}) {
     const chatInfo = getDoubaoChatInfo();
     const initialPage = await resolveInitialApiPage(chatInfo, limits, progress, controller);
     const conversationId = initialPage.conversationId;
     if (!conversationId) throw new Error("没有识别到可用 conversation_id。");
 
+    const cutoff = context.cutoff || { cutoffMs: 0, lastIndex: 0, mode: "off" };
     const messages = [];
     const seen = new Set();
     const seenAnchors = new Set();
-    const seenPages = new Set();
     let anchorIndex = initialPage.anchorIndex;
     let direction = initialPage.direction;
     let hasMore = true;
-    let repeatedPages = 0;
-    let rawCount = 0;
-    let lastAnchor = anchorIndex;
-    let stopReason = "complete";
     let prefetchedPageData = initialPage.firstPageData || null;
+    let pageCount = 0;
+    let rawCount = 0;
+    let duplicates = 0;
+    let noProgressPages = 0;
+    let stopReason = "unknown";
+    let lastAnchor = anchorIndex;
 
-    for (let page = 1; page <= limits.maxApiPages && hasMore; page += 1) {
+    while (pageCount < limits.maxApiPages) {
       checkCancelled(controller);
-      progress({
-        stage: "api",
-        message: `接口拉取第 ${page} 页，Anchor ${anchorIndex}`,
-        count: messages.length
-      });
       const currentAnchor = anchorIndex;
       seenAnchors.add(currentAnchor);
+      pageCount += 1;
+
+      progress({
+        stage: "api",
+        message: `接口拉取第 ${pageCount} 页（Anchor ${currentAnchor}），已取 ${messages.length} 条`,
+        count: messages.length
+      });
 
       let data;
       if (prefetchedPageData) {
@@ -379,115 +473,135 @@
         prefetchedPageData = null;
       } else {
         try {
-          data = await requestSingleChain({
-            conversationId,
-            anchorIndex: currentAnchor,
-            direction,
-            limit: limits.apiPageSize,
-            url: initialPage.url
-          });
+          data = await requestSingleChainWithRetry(
+            {
+              conversationId,
+              anchorIndex: currentAnchor,
+              direction,
+              limit: limits.apiPageSize,
+              url: initialPage.url
+            },
+            controller,
+            progress
+          );
         } catch (error) {
           throw attachPartialMessages(error, buildApiResult(messages));
         }
       }
 
-      const body = getSingleChainBody(data);
-
+      const body = Core.getSingleChainBody(data);
       if (!body) {
-        const error = new Error(`接口返回结构异常：${describeApiResponse(data)}`);
-        const partialMessages = buildApiResult(messages);
-        if (partialMessages.length) {
-          stopReason = "unexpected-response-body";
-          progress({
-            stage: "api",
-            message: `接口后续页结构异常，已保留 ${partialMessages.length} 条`,
-            count: partialMessages.length
-          });
-          break;
-        }
-        throw attachPartialMessages(error, partialMessages);
+        const error = new Error(`接口返回结构异常：${Core.describeApiResponse(data)}`);
+        if (!messages.length) throw attachPartialMessages(error, []);
+        stopReason = "unexpected-response-body";
+        progress({
+          stage: "api",
+          message: `接口后续页结构异常，已保留 ${messages.length} 条`,
+          count: messages.length
+        });
+        break;
       }
 
-      const pageMessages = Array.isArray(body.messages) ? body.messages : [];
+      const pageRaw = Array.isArray(body.messages) ? body.messages : [];
       hasMore = Boolean(body.has_more);
 
-      if (!pageMessages.length) break;
-      rawCount += pageMessages.length;
-
-      const pageKey = pageMessages.map(getApiMessageIdentity).join("|");
-      const beforeCount = messages.length;
-
-      for (const raw of pageMessages) {
-        const parsed = parseApiMessage(raw);
-        const key = parsed.messageId || `${parsed.index}:${parsed.role}:${parsed.text}`;
-        if (parsed.text && !seen.has(key)) {
-          seen.add(key);
-          messages.push(parsed);
+      if (!pageRaw.length) {
+        if (hasMore && noProgressPages < 2) {
+          const nextAnchor = Core.pickNextAnchor({ body, pageIndexes: [], currentAnchor });
+          if (nextAnchor > 0 && nextAnchor < currentAnchor) {
+            noProgressPages += 1;
+            anchorIndex = nextAnchor;
+            lastAnchor = nextAnchor;
+            continue;
+          }
         }
+        stopReason = "empty-page";
+        break;
       }
 
-      const addedCount = messages.length - beforeCount;
-      if (seenPages.has(pageKey)) {
-        repeatedPages += 1;
-      } else {
-        repeatedPages = 0;
-        seenPages.add(pageKey);
+      rawCount += pageRaw.length;
+      const pageMessages = pageRaw.map((raw) =>
+        Core.parseApiMessage(raw, { keepRaw: Boolean(context.keepRaw) })
+      );
+      const pageIndexes = pageRaw.map(Core.getMessageIndex);
+
+      let added = 0;
+      for (const parsed of pageMessages) {
+        const key = parsed.messageId || `${parsed.index}:${parsed.role}:${parsed.text}`;
+        if (seen.has(key)) {
+          duplicates += 1;
+          continue;
+        }
+        seen.add(key);
+        messages.push(parsed);
+        added += 1;
       }
 
+      if (Core.isPageBeforeCutoff(pageMessages, cutoff.cutoffMs)) {
+        stopReason = "cutoff-reached";
+        break;
+      }
       if (!hasMore) {
-        stopReason = "no-more";
+        stopReason = "has-more-false";
         break;
       }
-      if (repeatedPages >= 2) {
-        stopReason = "repeated-page";
+      if (!added) {
+        noProgressPages += 1;
+        if (noProgressPages >= 3) {
+          stopReason = "no-new-messages";
+          break;
+        }
+      } else {
+        noProgressPages = 0;
+      }
+
+      const nextAnchor = Core.pickNextAnchor({ body, pageIndexes, currentAnchor });
+      if (!nextAnchor || nextAnchor >= currentAnchor) {
+        stopReason = "anchor-not-advancing";
         progress({
           stage: "api",
-          message: "接口返回重复分页，已停止避免死循环",
+          message: `接口仍有更多内容，但无法继续向前翻页（Anchor ${currentAnchor}），已取 ${messages.length} 条`,
           count: messages.length
         });
         break;
-      }
-
-      const next = getNextApiAnchor(body, pageMessages, currentAnchor);
-      let nextAnchor = next.anchor;
-
-      if (!nextAnchor || seenAnchors.has(nextAnchor)) {
-        nextAnchor = getFallbackApiAnchor(pageMessages, currentAnchor);
-      }
-
-      if (!nextAnchor || seenAnchors.has(nextAnchor)) {
-        stopReason = "missing-next-anchor";
-        progress({
-          stage: "api",
-          message: `接口还有更多内容，但没有识别到下一页 Anchor。原始 ${rawCount} 条，可导出 ${messages.length} 条`,
-          count: messages.length
-        });
-        break;
-      }
-
-      if (!addedCount) {
-        progress({
-          stage: "api",
-          message: `第 ${page} 页没有可导出文本，继续查找后续历史`,
-          count: messages.length
-        });
       }
 
       anchorIndex = nextAnchor;
       lastAnchor = nextAnchor;
       direction = 1;
-
-      if (page === limits.maxApiPages) {
-        stopReason = "max-api-pages";
-      }
     }
 
-    progress({ stage: "api", message: "接口拉取完成", count: messages.length });
+    if (pageCount >= limits.maxApiPages) {
+      stopReason = "max-api-pages";
+    }
+
+    const ordered = buildApiResult(messages);
+    const selected =
+      cutoff.cutoffMs || cutoff.lastIndex
+        ? Core.filterMessagesIncremental(ordered, cutoff.cutoffMs, cutoff.lastIndex)
+        : ordered;
+
+    const integrity = Core.buildIntegrity({
+      messages: selected,
+      rawCount,
+      pageCount,
+      stopReason,
+      truncated: stopReason === "max-api-pages" || stopReason === "anchor-not-advancing",
+      duplicates
+    });
+
+    progress({
+      stage: "api",
+      message: `接口拉取完成，共 ${selected.length} 条（原始 ${rawCount} 条）`,
+      count: selected.length
+    });
+
     return {
-      messages: buildApiResult(messages),
+      messages: selected,
       meta: {
         sourceMode: "api",
         stopReason,
+        truncated: integrity.truncated,
         chatPathType: chatInfo.type,
         urlChatId: chatInfo.id,
         conversationId,
@@ -495,23 +609,58 @@
         initialDirection: initialPage.direction,
         apiStartAnchorSource: initialPage.source,
         rawCount,
+        duplicatesDropped: duplicates,
+        pageCount,
         lastAnchor,
         maxApiPages: limits.maxApiPages,
-        apiPageSize: limits.apiPageSize
+        apiPageSize: limits.apiPageSize,
+        resumeMode: cutoff.mode,
+        cutoffMs: cutoff.cutoffMs || 0,
+        integrity
       }
     };
   }
 
-  function buildApiResult(messages) {
-    return messages
-      .sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
-      .map(({ role, text, index, messageId, raw }) => ({ role, text, index, messageId, raw }));
+  async function requestSingleChainWithRetry(payload, controller, progress) {
+    const maxAttempts = 3;
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      checkCancelled(controller);
+      try {
+        return await requestSingleChain(payload);
+      } catch (error) {
+        lastError = error;
+        const message = String(error?.message || error);
+        if (/HTTP 40[13]/.test(message)) throw error;
+        if (attempt < maxAttempts) {
+          progress({
+            stage: "api",
+            message: `第 ${attempt} 次请求失败（${message}），正在重试`,
+            count: 0
+          });
+          await wait(400 * attempt * attempt);
+        }
+      }
+    }
+    throw lastError;
   }
 
-  function attachPartialMessages(error, partialMessages) {
-    const wrapped = error instanceof Error ? error : new Error(String(error));
-    wrapped.partialMessages = partialMessages;
-    return wrapped;
+  function buildApiResult(messages) {
+    return messages
+      .sort((a, b) => {
+        const ai = Number(a.index || 0);
+        const bi = Number(b.index || 0);
+        if (ai && bi) return ai - bi;
+        if (ai) return -1;
+        if (bi) return 1;
+        return (a.createTime || 0) - (b.createTime || 0);
+      })
+      .map((message) => ({ ...message }));
+  }
+
+  // 兼容旧调用点：解析与分页判断全部走 content-core.js
+  function parseApiMessage(raw, options) {
+    return Core.parseApiMessage(raw, options);
   }
 
   async function requestSingleChain({ conversationId, anchorIndex, direction, limit, url: observedUrl }) {
@@ -578,240 +727,6 @@
 
     return url.toString();
   }
-
-  function getSingleChainBody(data) {
-    return data?.downlink_body?.pull_single_chain_downlink_body
-      || data?.downlink_body?.pull_singe_chain_downlink_body
-      || data?.pull_single_chain_downlink_body
-      || data?.pull_singe_chain_downlink_body
-      || data?.data?.downlink_body?.pull_single_chain_downlink_body
-      || data?.data?.downlink_body?.pull_singe_chain_downlink_body
-      || data?.data?.pull_single_chain_downlink_body
-      || data?.data?.pull_singe_chain_downlink_body;
-  }
-
-  function describeApiResponse(data) {
-    if (!data || typeof data !== "object") return typeof data;
-    const keys = Object.keys(data).slice(0, 12).join(",");
-    const parts = [`keys=${keys || "none"}`];
-    ["code", "status", "status_code", "message", "msg", "err_no", "err_msg"].forEach((key) => {
-      if (data[key] !== undefined) parts.push(`${key}=${String(data[key]).slice(0, 120)}`);
-    });
-    if (data.data && typeof data.data === "object") {
-      const dataKeys = Object.keys(data.data).slice(0, 8).join(",");
-      parts.push(`data.keys=${dataKeys || "none"}`);
-    }
-    return parts.join(" ");
-  }
-
-  function parseApiMessage(raw) {
-    const text = extractApiText(raw);
-    return {
-      role: inferApiRole(raw),
-      text,
-      index: getApiMessageIndex(raw),
-      messageId: raw.message_id || raw.id || raw.server_message_id || "",
-      raw
-    };
-  }
-
-  function inferApiRole(raw) {
-    if (raw.sender_type === 1 || raw.user_type === 1 || raw.from_user_id || raw.sender?.user_id) {
-      return "user";
-    }
-    if (raw.bot_reply_message_id || raw.reply_id || raw.sender_type === 2 || raw.user_type === 2) {
-      return "assistant";
-    }
-    if (raw.message_type === 1 && raw.content) return "user";
-    return raw.content && !raw.brief ? "user" : "assistant";
-  }
-
-  function extractApiText(raw) {
-    const contentObject = parseMaybeJson(raw.content);
-    const contentObjObject = parseMaybeJson(raw.content_obj);
-    const messageContentObject = parseMaybeJson(raw.message_content);
-    const contentBlock = parseMaybeJson(raw.content_block);
-
-    const blockText = extractContentBlockText(contentBlock || raw.content_block);
-    if (blockText) return blockText;
-
-    const candidates = [
-      contentObject?.text,
-      contentObject?.content,
-      contentObject?.message,
-      contentObjObject?.text,
-      contentObjObject?.content,
-      contentObjObject?.message,
-      messageContentObject?.text,
-      messageContentObject?.content,
-      messageContentObject?.message,
-      raw.content,
-      raw.brief,
-      raw.content_obj?.text,
-      raw.content_obj?.content,
-      raw.message_content,
-      raw.tts_content,
-      raw.text
-    ];
-
-    for (const candidate of candidates) {
-      if (typeof candidate === "string" && !looksLikeJson(candidate) && normalizeText(candidate)) {
-        return normalizeText(candidate);
-      }
-    }
-
-    return "";
-  }
-
-  function getNextApiAnchor(body, pageMessages, currentAnchor) {
-    const explicitAnchor = getFirstPositiveInteger(
-      body.next_anchor_index,
-      body.next_anchor,
-      body.next_index,
-      body.next_index_in_conv,
-      body.min_anchor_index,
-      body.min_index,
-      body.min_index_in_conv,
-      body.last_index,
-      body.last_index_in_conv,
-      body.cursor?.next_anchor_index,
-      body.cursor?.anchor_index,
-      body.cursor?.index_in_conv,
-      body.page_info?.next_anchor_index,
-      body.page_info?.min_index,
-      body.page_info?.min_index_in_conv,
-      body.pagination?.next_anchor_index,
-      body.pagination?.min_index,
-      body.pagination?.min_index_in_conv
-    );
-
-    if (explicitAnchor && explicitAnchor !== currentAnchor) {
-      return { anchor: explicitAnchor, source: "body" };
-    }
-
-    const indexes = pageMessages.map(getApiMessageIndex).filter(Boolean);
-    if (!indexes.length) return { anchor: 0, source: "" };
-
-    const minIndex = Math.min(...indexes);
-    if (minIndex < currentAnchor) return { anchor: minIndex, source: "message" };
-    return { anchor: Math.max(1, minIndex - 1), source: "message-minus-one" };
-  }
-
-  function getFallbackApiAnchor(pageMessages, currentAnchor) {
-    const indexes = pageMessages.map(getApiMessageIndex).filter(Boolean);
-    if (indexes.length) {
-      return Math.max(1, Math.min(...indexes) - 1);
-    }
-
-    if (currentAnchor > 1 && currentAnchor < Number.MAX_SAFE_INTEGER) {
-      return Math.max(1, currentAnchor - pageMessages.length);
-    }
-
-    return 0;
-  }
-
-  function getApiMessageIndex(raw) {
-    const ext = parseMaybeJson(raw.ext);
-    const localInfo = parseMaybeJson(raw.local_info);
-    const messageInfo = parseMaybeJson(raw.message_info);
-    return getFirstPositiveInteger(
-      raw.index,
-      raw.index_in_conv,
-      raw.message_index,
-      raw.msg_index,
-      raw.chain_index,
-      raw.conversation_index,
-      raw.item_index,
-      raw.position,
-      raw.seq_index,
-      raw.sequence_index,
-      raw.sort_index,
-      raw.extra?.index,
-      raw.extra?.index_in_conv,
-      raw.extra?.message_index,
-      raw.extra?.chain_index,
-      ext?.index,
-      ext?.index_in_conv,
-      ext?.message_index,
-      ext?.chain_index,
-      localInfo?.index,
-      localInfo?.index_in_conv,
-      localInfo?.message_index,
-      messageInfo?.index,
-      messageInfo?.index_in_conv,
-      messageInfo?.message_index
-    );
-  }
-
-  function getApiMessageIdentity(raw) {
-    return String(
-      raw.message_id
-        || raw.id
-        || raw.server_message_id
-        || `${getApiMessageIndex(raw)}:${raw.role || raw.sender_type || ""}:${raw.brief || raw.content || ""}`
-    );
-  }
-
-  function getFirstPositiveInteger(...values) {
-    for (const value of values) {
-      const number = Number(value);
-      if (Number.isFinite(number) && number > 0) return Math.floor(number);
-    }
-    return 0;
-  }
-
-  function parseMaybeJson(value) {
-    if (!value) return value;
-    if (typeof value === "object") return value;
-    if (typeof value !== "string" || !looksLikeJson(value)) return null;
-    try {
-      return JSON.parse(value);
-    } catch (_error) {
-      return null;
-    }
-  }
-
-  function looksLikeJson(value) {
-    const text = String(value || "").trim();
-    return (text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"));
-  }
-
-  function extractContentBlockText(blocks) {
-    if (!Array.isArray(blocks) && typeof blocks !== "object") return "";
-    const parts = [];
-
-    const visit = (value) => {
-      if (!value) return;
-      if (typeof value === "string") {
-        const text = normalizeText(value);
-        if (text && !/^https?:\/\//.test(text)) parts.push(text);
-        return;
-      }
-      if (Array.isArray(value)) {
-        value.forEach(visit);
-        return;
-      }
-      if (typeof value === "object") {
-        [
-          "text",
-          "content",
-          "summary",
-          "title",
-          "markdown",
-          "code",
-          "text_block",
-          "markdown_block",
-          "code_block",
-          "quote_block",
-          "paragraph"
-        ].forEach((key) => visit(value[key]));
-      }
-    };
-
-    visit(blocks);
-    return Array.from(new Set(parts)).join("\n\n");
-  }
-
   async function collectByScrolling(progress, controller, limits) {
     const scroller = findScroller();
     if (!scroller) return collectVisibleMessages();
@@ -1045,43 +960,6 @@
       .sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
   }
 
-  function buildPayload(messages, meta = {}) {
-    return {
-      source: "doubao",
-      url: location.href,
-      title: document.title,
-      chatId: location.pathname.split("/").filter(Boolean).pop() || "",
-      exportedAt: new Date().toISOString(),
-      meta,
-      messages: messages.map(({ role, text, messageId, raw }, index) => ({
-        index: index + 1,
-        role,
-        text,
-        ...(messageId ? { messageId } : {}),
-        ...(raw ? { raw } : {})
-      }))
-    };
-  }
-
-  function toMarkdown(payload) {
-    const lines = [
-      "# 豆包对话导出",
-      "",
-      `- 标题：${payload.title || "豆包对话"}`,
-      `- URL：${payload.url}`,
-      `- 导出时间：${payload.exportedAt}`,
-      "",
-      "## 对话",
-      ""
-    ];
-
-    for (const message of payload.messages) {
-      lines.push(`### ${message.role === "user" ? "用户" : "豆包"}`, "", message.text, "");
-    }
-
-    return lines.join("\n");
-  }
-
   function downloadText(filename, content, mime) {
     const blob = new Blob([content], { type: `${mime};charset=utf-8` });
     const url = URL.createObjectURL(blob);
@@ -1135,8 +1013,8 @@
     return {
       maxSeekSteps: clampInteger(options.maxSeekSteps, 240),
       maxCollectScreens: clampInteger(options.maxCollectScreens, 300),
-      maxApiPages: clampInteger(options.maxApiPages, 1000, 1, 5000),
-      apiPageSize: clampInteger(options.apiPageSize, 20, 1, 50),
+      maxApiPages: clampInteger(options.maxApiPages, 5000, 1, 20000),
+      apiPageSize: clampInteger(options.apiPageSize, 50, 1, 50),
       apiStartAnchor: optionalInteger(options.apiStartAnchor, 0, Number.MAX_SAFE_INTEGER)
     };
   }
@@ -1236,10 +1114,10 @@
           conversationId: candidate.conversationId,
           anchorIndex: candidate.anchorIndex,
           direction: candidate.direction,
-          limit: Math.min(limits.apiPageSize, 20),
+          limit: Math.min(limits.apiPageSize, 50),
           url: candidate.url
         });
-        const body = getSingleChainBody(data);
+        const body = Core.getSingleChainBody(data);
         const pageMessages = Array.isArray(body?.messages) ? body.messages : [];
         if (pageMessages.length) {
           return {
@@ -1247,7 +1125,7 @@
             firstPageData: data
           };
         }
-        errors.push(`${candidate.source}: ${body ? "empty" : describeApiResponse(data)}`);
+        errors.push(`${candidate.source}: ${body ? "empty" : Core.describeApiResponse(data)}`);
       } catch (error) {
         errors.push(`${candidate.source}: ${error.message || error}`);
       }

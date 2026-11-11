@@ -1,0 +1,11 @@
+{
+ "conversation_id": "119275693619458",
+ "message_id": "60181507869409282",
+ "user_type": 2,
+ "index_in_conv": "50399",
+ "create_time": "1793327296",
+ "content_type": 1,
+ "content": "{\"multi_reference\": {}, \"search_references\": [], \"text\": \"你看这样安排行不行\", \"text_tags\": []}",
+ "thinking_content": "{\"thinks\": [{\"text\": \"用户要整理出差清单和穿搭建议，我需确认其行程为10月30日至11月1日，还得查询南通和长春在此期间的天气情况。\\n\\n用户提到出差两天带一个包，“今天去，后天回”，我需确认具体日期及住宿晚数。\", \"position\": 0, \"is_finish\": true, \"text_tags\": [{\"type\": 102, \"tag_info\": \"{\\\"idx\\\":3,\\\"data\\\":[...]}\"}]}]}",
+ "content_block": []
+}
